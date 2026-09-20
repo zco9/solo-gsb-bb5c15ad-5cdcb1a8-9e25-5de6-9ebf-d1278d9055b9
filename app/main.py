@@ -12,6 +12,7 @@ from .models import (
     DraftUpdateRequest,
     MergeCreate,
     ResolveRequest,
+    ReuseResolutionsRequest,
     RuleResolveRequest,
 )
 from .validation import InvalidResultSchema, ResultValidationFailed
@@ -61,6 +62,23 @@ async def not_resolved_handler(request: Request, exc: store.MergeNotResolved):
     return JSONResponse(
         status_code=409,
         content={"detail": "merge is pending: no result patch is available yet"},
+    )
+
+
+@app.exception_handler(store.SourceMergeNotResolved)
+async def source_not_resolved_handler(
+    request: Request, exc: store.SourceMergeNotResolved
+):
+    return JSONResponse(
+        status_code=409,
+        content={
+            "detail": (
+                f"source merge {exc.source_merge_id!r} is not resolved: "
+                "only a resolved merge may supply reusable resolutions"
+            ),
+            "source_merge_id": exc.source_merge_id,
+            "source_status": exc.status,
+        },
     )
 
 
@@ -248,6 +266,28 @@ def resolve_by_rules(merge_id: str, body: RuleResolveRequest):
         {"left": rule.left, "right": rule.right} for rule in body.rules
     ]
     return store.apply_rule_resolutions(merge_id, body.revision, rule_items)
+
+
+@app.post("/merges/{merge_id}/reuse-resolutions")
+def reuse_resolutions(merge_id: str, body: ReuseResolutionsRequest):
+    """Reuse an already-resolved source merge's conflict resolutions.
+
+    Each of the target's currently open conflicts is matched by JSON
+    Pointer against the source merge's conflict snapshot; only conflicts
+    whose base/left/right values and ``missing`` sides are identical after
+    normalisation (a missing key never matches an explicit JSON null) are
+    reused. The value is read from the source's immutable final result —
+    an absent path means the source chose a deletion, applied identically
+    here. All matching items are applied atomically with a single revision
+    bump and the response reports per-pointer ``applied`` and ``skipped``
+    entries (with reasons). Zero matches write nothing and do not bump the
+    revision. A stale revision, a non-resolved/unknown source merge, or a
+    final result_schema failure yields the usual 409/404/422 with no
+    partial modification.
+    """
+    return store.reuse_resolutions(
+        merge_id, body.revision, body.source_merge_id
+    )
 
 
 # ---------------------------------------------------------------------------

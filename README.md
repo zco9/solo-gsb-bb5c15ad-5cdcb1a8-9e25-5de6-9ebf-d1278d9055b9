@@ -45,6 +45,7 @@ SQLite 数据文件持久化在名为 `merge-data` 的 Docker volume 中（容�
 | `POST` | `/merges/{merge_id}/resolutions` | 携带 revision 分批提交冲突取值（最后一批须通过 schema 门禁） |
 | `POST` | `/merges/{merge_id}/resolution-preview` | 预演冲突解决：内存副本上校验并应用，不落库、不改状态 |
 | `POST` | `/merges/{merge_id}/rule-resolutions` | 携带 revision 与有序路径规则，按模式批量裁决冲突（最后一批须通过门禁） |
+| `POST` | `/merges/{merge_id}/reuse-resolutions` | 携带 revision 与 source_merge_id，复用历史已 resolved 合并单的冲突裁决 |
 | `POST` | `/merges/{merge_id}/drafts` | 为待处理合并单创建解决草案（固定创建时的 revision） |
 | `GET` | `/merges/{merge_id}/drafts/{draft_id}` | 查看草案：状态、钉住的 base_revision、已累积的取值 |
 | `POST` | `/merges/{merge_id}/drafts/{draft_id}/resolutions` | 向草案追加或覆盖冲突取值（只改草案，不改合并单） |
@@ -328,7 +329,54 @@ curl -s -X POST http://localhost:8000/merges/bc6d2c3d9a3343bf9177147a10ec4023/dr
 - **部分草案也可提交**：未覆盖的冲突原样保留，合并单继续 `pending`（与分批 resolutions 语义一致）；空草案（无任何取值）提交 → `400`。
 - 合并单已 `resolved` → 创建草案与提交草案均 `409`；合并单或草案不存在 → `404`（草案不能跨合并单 URL 访问）。
 
-### 7. 获取确定性补丁 — `GET /merges/{merge_id}/patch`
+### 7. 复用历史裁决 — `POST /merges/{merge_id}/reuse-resolutions`
+
+同类配置的合并往往反复出现相同冲突。本端点把一个**历史已 `resolved` 合并单（来源）**的最终裁决复用到当前合并单（目标）尚开放的冲突上。请求只需携带来源合并单 ID 与目标当前 `revision`：
+
+```bash
+curl -s -X POST http://localhost:8000/merges/3f9a…/reuse-resolutions \
+  -H 'Content-Type: application/json' \
+  -d '{"source_merge_id": "bc6d2c3d9a3343bf9177147a10ec4023", "revision": 1}'
+```
+
+**匹配规则（逐项）**：按 JSON Pointer 把目标当前开放的每个冲突与来源**创建时冻结的冲突快照**（持久化字段 `conflict_snapshot`，冲突只会随批次减少，故创建时即完整快照）中同指针的冲突对齐，然后比较规范化后的四方语义：
+
+- 来源快照中不存在同指针冲突 → 跳过（`no_source_conflict`）；
+- `base`、`left`、`right` 任一方不同，或 `missing`（删除侧集合）不同 → 跳过（`shape_mismatch`，响应逐项列出 `differences`）；
+- 只有四方语义**完全一致**才复用。规范化严格区分**键缺失与显式 `null`**：缺失侧（在 `missing` 中）永远不与显式 `null` 相等；此外采用 JSON 严格类型相等（`true` ≠ `1`），对象/数组按结构递归比较。
+
+**复用值来自来源的最终结果**（而非来源提交时的候选侧）：在来源 `result` 上按指针取值——路径存在则 `set` 该值（包括显式 `null`）；路径已不存在则说明来源当时选择了删除侧，目标中**同样删除该键**（`delete`）。
+
+```json
+{
+  "merge_id": "3f9a…",
+  "source_merge_id": "bc6d2c3d9a3343bf9177147a10ec4023",
+  "status": "pending",
+  "revision": 2,
+  "document": { "...": "..." },
+  "conflicts": [ { "pointer": "/feature/x", "base": 0, "left": 1, "right": 2, "missing": [] } ],
+  "conflict_count": 1,
+  "result": null,
+  "applied": [
+    {"pointer": "/db/host", "action": "set", "value": "b"},
+    {"pointer": "/db/port", "action": "set", "value": 5433},
+    {"pointer": "/db/tls",  "action": "delete"}
+  ],
+  "skipped": [
+    {"pointer": "/feature/x", "reason": "no_source_conflict"},
+    {"pointer": "/db/mode", "reason": "shape_mismatch", "differences": ["right"]}
+  ],
+  "created_at": "...", "updated_at": "..."
+}
+```
+
+- **原子应用**：所有匹配项先在内存中验证并应用，再以**单条 UPDATE 事务**写入，`revision` 恰好 **+1**；任一匹配项应用失败或最终 `result_schema` 门禁失败（仅当复用将解决最后一个冲突时校验），整批回滚、**不产生任何部分修改**，错误分别为 `400` / `422`。
+- **门禁语义与其余裁决端点一致**：部分复用后仍有开放冲突（工作文档还带占位符）不做 schema 校验；目标 schema 的最终校验失败列表规则同 `resolutions`。
+- **一个匹配项都没有**时不写入、**不递增 revision**（`revision` 保持原值，`applied: []`，每个开放冲突都在 `skipped` 中带原因），仍返回 `200`，不算错误。
+- **revision 过期 → `409`**（响应体携带 `current_revision`）；目标已 `resolved` → `409`；目标合并单不存在 → `404`。
+- **来源必须已 `resolved`**：来源不存在 → `404`；来源仍为 `pending`（或以目标自身作为来源）→ `409`（响应体含 `source_merge_id` 与 `source_status`）。来源本身无冲突、创建即 `resolved` 时快照为空，所有目标冲突均以 `no_source_conflict` 跳过。
+
+### 8. 获取确定性补丁 — `GET /merges/{merge_id}/patch`
 
 合并单 `resolved` 后，可获取从**原始 `base_doc` 到最终 `result`** 的确定性操作序列（[RFC 6902 JSON Patch](https://www.rfc-editor.org/rfc/rfc6902)，路径为 [RFC 6901 JSON Pointer](https://www.rfc-editor.org/rfc/rfc6901)）：
 
@@ -378,7 +426,7 @@ curl -s http://localhost:8000/merges/bc6d2c3d9a3343bf9177147a10ec4023/patch
 pip install -r requirements.txt
 pip install httpx pytest
 uvicorn app.main:app --reload --port 8000   # 本地运行
-python -m pytest tests/ -q                  # 运行测试（100 项）
+python -m pytest tests/ -q                  # 运行测试（117 项）
 ```
 
 ## 项目结构
@@ -388,12 +436,13 @@ app/
   main.py       # FastAPI 路由与错误映射（404/409/400/422）
   merge.py      # 纯 Python 三方合并引擎（JSON Pointer 递归）
   rules.py      # RFC 6901 风格路径模式（* 与 **）：规则编译、匹配、批量裁决
+  reuse.py      # 历史裁决复用：缺失键/null 语义规范化、严格 JSON 相等、逐项匹配
   patch.py      # 确定性 RFC 6902 补丁生成 + 规范化 SHA-256
   validation.py # Draft 2020-12 结果门禁：元 schema 校验 + 最终结果校验（422 错误排序）
-  store.py      # 合并单状态机 + 解决草案：revision 校验、冲突解决、不可变结果、schema 门禁
+  store.py      # 合并单状态机 + 解决草案 + 历史复用：revision 校验、冲突解决、不可变结果、schema 门禁
   db.py         # SQLite 连接与建表（启动时执行，含轻量列迁移与单事务提交支持）
-  models.py     # Pydantic 请求模型（含可选 result_schema、草案编辑请求）
-tests/          # 合并引擎/补丁单测 + API 端到端测试（含 schema 门禁与草案测试）
+  models.py     # Pydantic 请求模型（含可选 result_schema、草案编辑与复用请求）
+tests/          # 合并引擎/补丁单测 + API 端到端测试（schema 门禁、草案与历史复用）
 Dockerfile
 docker-compose.yml
 requirements.txt

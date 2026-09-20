@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS merges (
     conflicts       TEXT NOT NULL,
     result          TEXT,
     result_schema   TEXT,
+    conflict_snapshot TEXT NOT NULL DEFAULT '[]',
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL
 );
@@ -58,9 +59,13 @@ def connect() -> sqlite3.Connection:
 # Objects created after the initial release; applied to database files that
 # predate them so an existing Docker volume keeps working. The merge_drafts
 # table is part of SCHEMA above (CREATE TABLE IF NOT EXISTS runs on every
-# startup); only column-level changes need an ALTER here.
+# startup); only column-level changes need an ALTER here. conflict_snapshot
+# holds the source merge's conflict list frozen at creation time, used by the
+# historical-resolution reuse endpoint; rows predating the column keep an
+# empty snapshot and simply never yield reusable items.
 _MIGRATIONS = (
     "ALTER TABLE merges ADD COLUMN result_schema TEXT",
+    "ALTER TABLE merges ADD COLUMN conflict_snapshot TEXT NOT NULL DEFAULT '[]'",
 )
 
 
