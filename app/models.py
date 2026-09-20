@@ -70,6 +70,15 @@ class RuleResolveRequest(BaseModel):
     )
 
 
+class ReuseResolutionsRequest(BaseModel):
+    revision: int = Field(..., description="Current merge revision (409 if stale)")
+    source_merge_id: str = Field(
+        ...,
+        min_length=1,
+        description="ID of an already resolved merge whose adjudications are reused",
+    )
+
+
 class DraftUpdateRequest(BaseModel):
     resolutions: list[ResolutionItem] = Field(
         ...,

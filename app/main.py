@@ -12,6 +12,7 @@ from .models import (
     DraftUpdateRequest,
     MergeCreate,
     ResolveRequest,
+    ReuseResolutionsRequest,
     RuleResolveRequest,
 )
 from .validation import InvalidResultSchema, ResultValidationFailed
@@ -125,6 +126,11 @@ async def rule_apply_failed_handler(request: Request, exc: store.RuleApplication
             "reason": exc.reason,
         },
     )
+
+
+@app.exception_handler(store.SourceMergeInvalid)
+async def source_merge_invalid_handler(request: Request, exc: store.SourceMergeInvalid):
+    return JSONResponse(status_code=400, content={"detail": str(exc)})
 
 
 @app.exception_handler(InvalidResultSchema)
@@ -248,6 +254,25 @@ def resolve_by_rules(merge_id: str, body: RuleResolveRequest):
         {"left": rule.left, "right": rule.right} for rule in body.rules
     ]
     return store.apply_rule_resolutions(merge_id, body.revision, rule_items)
+
+
+@app.post("/merges/{merge_id}/reuse-resolutions")
+def reuse_resolutions(merge_id: str, body: ReuseResolutionsRequest):
+    """Reuse a resolved merge's adjudications on the current conflicts.
+
+    The source merge must already be resolved. Each open conflict of the
+    target is matched at the same JSON Pointer against the source's
+    conflict snapshot; reuse requires base/left/right and the missing
+    semantics to be identical after canonicalization (an absent key is
+    not an explicit null). Matched values come from the source's final
+    result, and a path the source deleted is deleted in the target too.
+    All matches apply atomically with one revision bump; a stale
+    revision, an illegal/unresolved source or a failed final
+    result_schema gate writes nothing. With no matches nothing is
+    written and the revision stays unchanged; ``applied`` / ``skipped``
+    report every conflict and its per-item reason.
+    """
+    return store.reuse_resolutions(merge_id, body.revision, body.source_merge_id)
 
 
 # ---------------------------------------------------------------------------

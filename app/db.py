@@ -23,6 +23,9 @@ CREATE TABLE IF NOT EXISTS merges (
     right_doc       TEXT NOT NULL,
     document        TEXT NOT NULL,
     conflicts       TEXT NOT NULL,
+    -- Conflict snapshot as first recorded, preserved across resolutions
+    -- so later merges can reuse this order's historical adjudications.
+    source_conflicts TEXT,
     result          TEXT,
     result_schema   TEXT,
     created_at      TEXT NOT NULL,
@@ -58,9 +61,11 @@ def connect() -> sqlite3.Connection:
 # Objects created after the initial release; applied to database files that
 # predate them so an existing Docker volume keeps working. The merge_drafts
 # table is part of SCHEMA above (CREATE TABLE IF NOT EXISTS runs on every
-# startup); only column-level changes need an ALTER here.
+# startup); only column-level changes need an ALTER here. Each entry pairs
+# the statement with the column it adds, for an idempotent existence check.
 _MIGRATIONS = (
-    "ALTER TABLE merges ADD COLUMN result_schema TEXT",
+    ("ALTER TABLE merges ADD COLUMN result_schema TEXT", "result_schema"),
+    ("ALTER TABLE merges ADD COLUMN source_conflicts TEXT", "source_conflicts"),
 )
 
 
@@ -69,8 +74,7 @@ def init_schema() -> None:
         conn = connect()
         conn.executescript(SCHEMA)
         existing = {row["name"] for row in conn.execute("PRAGMA table_info(merges)")}
-        for statement in _MIGRATIONS:
-            column = statement.split("ADD COLUMN", 1)[1].split()[0]
+        for statement, column in _MIGRATIONS:
             if column not in existing:
                 conn.execute(statement)
         conn.commit()

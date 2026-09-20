@@ -57,6 +57,10 @@ def merge3(base: Any, left: Any, right: Any) -> tuple[Any, list[dict]]:
     """
     conflicts: list[dict] = []
     doc = _merge(base, left, right, "", conflicts)
+    # The recursion visits object keys through a set union; sort on the way
+    # out so conflict order (and thus snapshot/reuse order) is deterministic
+    # regardless of Python's hash-seeded set iteration.
+    conflicts.sort(key=lambda c: c["pointer"])
     return doc, conflicts
 
 

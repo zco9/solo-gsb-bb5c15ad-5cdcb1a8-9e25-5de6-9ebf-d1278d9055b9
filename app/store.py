@@ -10,6 +10,11 @@ from typing import Any
 from . import db, rules
 from .merge import MISSING, delete_at, merge3, parse_pointer, set_at
 from .patch import generate_patch, sha256_hex
+from .reuse import (
+    build_reuse_plan,
+    match_to_batch_item,
+    match_to_view,
+)
 from .validation import check_result_schema, validate_result
 from .rules import (
     InvalidPattern,
@@ -66,6 +71,10 @@ class DraftNotOpen(Exception):
 
 class DraftConflictSetChanged(Exception):
     """The merge's open conflicts no longer cover the draft's pointers."""
+
+
+class SourceMergeInvalid(Exception):
+    """The source merge of a reuse request cannot provide resolutions."""
 
 
 def _now() -> str:
@@ -160,9 +169,9 @@ def create_merge(
             INSERT INTO merges (
                 id, idempotency_key, status, revision,
                 base_doc, left_doc, right_doc,
-                document, conflicts, result, result_schema,
+                document, conflicts, source_conflicts, result, result_schema,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 merge_id,
@@ -173,6 +182,10 @@ def create_merge(
                 json.dumps(left),
                 json.dumps(right),
                 json.dumps(document),
+                json.dumps(conflicts),
+                # Immutable snapshot of the conflicts as first recorded:
+                # resolutions shrink ``conflicts`` but reuse matching needs
+                # the original base/left/right/missing of every conflict.
                 json.dumps(conflicts),
                 json.dumps(result) if result is not None else None,
                 json.dumps(result_schema) if result_schema is not None else None,
@@ -381,6 +394,115 @@ def apply_rule_resolutions(
     view["rule_matches"] = rule_matches
     view["unmatched_conflicts"] = unmatched
     view["applied"] = True
+    return view
+
+
+# ---------------------------------------------------------------------------
+# Historical resolution reuse
+# ---------------------------------------------------------------------------
+
+
+def reuse_resolutions(
+    merge_id: str, expected_revision: int, source_merge_id: str
+) -> dict:
+    """Reuse a resolved merge's adjudications on the current open conflicts.
+
+    Every open conflict is matched by JSON Pointer against the source
+    merge's conflict snapshot; a match requires base/left/right and the
+    missing semantics to be identical after canonicalization (an absent
+    key never matches an explicit null). Each match takes its final value
+    from the source's immutable result — a path missing there deletes the
+    target key as well. Matching and validation run entirely in memory;
+    the single UPDATE either applies every match (one revision bump) or
+    nothing at all. Zero matches is a successful no-op: no write and no
+    revision bump.
+
+    Raises StaleRevision (409) / AlreadyResolved (409) for the target and
+    SourceMergeInvalid (400) when the source is unknown, still pending or
+    has no conflict snapshot.
+    """
+    with db.transaction() as conn:
+        row = conn.execute(
+            "SELECT * FROM merges WHERE id = ?", (merge_id,)
+        ).fetchone()
+        if row is None:
+            raise MergeNotFound(merge_id)
+        if row["status"] == STATUS_RESOLVED:
+            raise AlreadyResolved(merge_id)
+        if row["revision"] != expected_revision:
+            raise StaleRevision(row["revision"])
+
+        source_row = conn.execute(
+            "SELECT * FROM merges WHERE id = ?", (source_merge_id,)
+        ).fetchone()
+        if source_row is None:
+            raise SourceMergeInvalid(
+                f"source merge {source_merge_id!r} does not exist"
+            )
+        if source_row["status"] != STATUS_RESOLVED or source_row["result"] is None:
+            raise SourceMergeInvalid(
+                f"source merge {source_merge_id!r} is not resolved yet"
+            )
+        if source_row["source_conflicts"] is None:
+            # Rows created before conflict snapshots existed cannot serve as
+            # a reuse source: their original conflict candidates are gone.
+            raise SourceMergeInvalid(
+                f"source merge {source_merge_id!r} has no conflict snapshot"
+            )
+        if source_merge_id == merge_id:
+            raise SourceMergeInvalid(
+                "a merge cannot reuse resolutions from itself"
+            )
+
+        target_conflicts = json.loads(row["conflicts"])
+        source_conflicts = json.loads(source_row["source_conflicts"])
+        source_result = json.loads(source_row["result"])
+        matches, skipped = build_reuse_plan(
+            target_conflicts, source_conflicts, source_result
+        )
+
+        if not matches:
+            # Nothing reusable: no write, no revision bump.
+            applied = False
+        else:
+            conflict_by_pointer = {c["pointer"]: c for c in target_conflicts}
+            batch = [
+                match_to_batch_item(match, conflict_by_pointer[match.pointer])
+                for match in matches
+            ]
+            document, remaining = _apply_batch(
+                json.loads(row["document"]), target_conflicts, batch
+            )
+            resolved = not remaining
+            # Same gate as every other resolving path: only the batch that
+            # closes the last conflict is checked against result_schema.
+            if resolved and row["result_schema"] is not None:
+                validate_result(json.loads(row["result_schema"]), document)
+            conn.execute(
+                """
+                UPDATE merges
+                SET status = ?, revision = revision + 1, document = ?,
+                    conflicts = ?, result = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    STATUS_RESOLVED if resolved else STATUS_PENDING,
+                    json.dumps(document),
+                    json.dumps(remaining),
+                    json.dumps(document) if resolved else None,
+                    _now(),
+                    merge_id,
+                ),
+            )
+            applied = True
+
+    view = get_merge(merge_id)
+    view["applied"] = applied
+    view["source_merge_id"] = source_merge_id
+    view["applied_resolutions"] = [match_to_view(m) for m in matches]
+    view["skipped"] = skipped
+    view["applied_count"] = len(matches)
+    view["skipped_count"] = len(skipped)
     return view
 
 
